@@ -1,0 +1,11 @@
+services:
+  api:
+    build: .
+    image: anonymous-review-assign:latest
+    container_name: review-assign-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 服务监听端口（容器内），默认 8000
+      PORT: "8000"
+    restart: unless-stopped
