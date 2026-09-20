@@ -917,3 +917,373 @@ def test_incremental_track_infeasible_still_diagnoses():
     assert set(unsat) == {"m2"}
     assert unsat["m2"]["eligible_remaining_capacity"] == 0
     assert unsat["m2"]["capacity_gap"] == 1
+
+
+# ---------- 不可行性证明：bottleneck_cut 全局最小割 ----------
+
+_CUT_GROUPS = ("demand", "eligibility", "track_capacity", "reviewer_capacity")
+
+
+def _assert_cut_invariants(data: dict, locked_total: int = 0) -> dict:
+    """校验 bottleneck_cut 的通用不变量并返回该结构。
+
+    locked_total 为已固化的合法锁定名额数（普通模式 0）：增量模式的瓶颈割建在
+    扣除锁定占用后的残量网络上，跨割边容量之和 = 剩余网络最大流；
+    max_assignable = locked_total + 割容量。
+    """
+    cut = data["bottleneck_cut"]
+    assert cut is not None
+    # 绝不随证明泄露部分分配
+    assert data["assignments"] is None
+
+    # 源侧节点列表均按业务 ID 排序
+    assert cut["source_manuscripts"] == sorted(cut["source_manuscripts"])
+    assert cut["source_reviewers"] == sorted(cut["source_reviewers"])
+    assert cut["source_reviewer_tracks"] == [
+        list(pair) for pair in sorted(
+            (pair[0], pair[1]) for pair in cut["source_reviewer_tracks"]
+        )
+    ]
+    for pair in cut["source_reviewer_tracks"]:
+        assert len(pair) == 2
+
+    # 四类跨割边的组内排序键
+    sort_keys = {
+        "demand": lambda e: e["manuscript_id"] or "",
+        "eligibility": lambda e: (
+            e["manuscript_id"] or "", e["reviewer_id"] or "", e["track"] or ""
+        ),
+        "track_capacity": lambda e: (e["reviewer_id"] or "", e["track"] or ""),
+        "reviewer_capacity": lambda e: e["reviewer_id"] or "",
+    }
+    for group in _CUT_GROUPS:
+        edges = cut[group]
+        assert edges == sorted(edges, key=sort_keys[group])
+        for e in edges:
+            assert e["type"] == group
+            assert e["capacity"] >= 0
+
+    cut_capacity = sum(
+        e["capacity"] for group in _CUT_GROUPS for e in cut[group]
+    )
+    # 最大流最小割：跨割饱和边容量之和 = 本次（剩余）网络的最大流
+    assert cut["max_assignable"] == locked_total + cut_capacity
+    assert cut["max_assignable"] + cut["shortfall"] == data["total_required"]
+    assert cut["max_assignable"] == data["total_assigned"]
+    assert cut["shortfall"] > 0
+    return cut
+
+
+def test_bottleneck_cut_total_capacity_gap():
+    """总容量不足：瓶颈割由两条评审人->汇饱和边构成。"""
+    body = {
+        "required_reviewers": 2,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"]},
+            {"id": "m2", "authors": [], "topics": ["t"]},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    cut = _assert_cut_invariants(data)
+    assert cut["max_assignable"] == 2
+    assert cut["shortfall"] == 2
+    assert cut["source_manuscripts"] == ["m1", "m2"]
+    assert cut["source_reviewers"] == ["r1", "r2"]
+    assert cut["demand"] == []
+    assert cut["eligibility"] == []
+    assert cut["track_capacity"] == []
+    assert [(e["reviewer_id"], e["capacity"]) for e in cut["reviewer_capacity"]] == [
+        ("r1", 1), ("r2", 1),
+    ]
+
+
+def test_bottleneck_cut_eligibility_gap():
+    """候选不足：瓶颈割由饱和的资格边构成（Hall 型割）。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+             "required_reviewers": 2},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["ml"], "capacity": 5},
+            {"id": "r2", "topics": ["ml"], "capacity": 5,
+             "conflicted_authors": ["alice"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    cut = _assert_cut_invariants(data)
+    assert cut["max_assignable"] == 1
+    assert cut["shortfall"] == 1
+    assert cut["source_manuscripts"] == ["m1"]
+    assert cut["source_reviewers"] == []
+    # 只有合格边 m1->r1 跨割；不合格的 r2 根本没有建边
+    assert [(e["manuscript_id"], e["reviewer_id"], e["capacity"])
+            for e in cut["eligibility"]] == [("m1", "r1", 1)]
+    assert cut["reviewer_capacity"] == []
+    assert cut["demand"] == []
+    assert cut["track_capacity"] == []
+
+
+def test_bottleneck_cut_no_eligible_reviewer():
+    """无任何合格评审：割容量为 0，四类跨割边均可为空。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["quantum"],
+             "required_reviewers": 1},
+        ],
+        "reviewers": [{"id": "r1", "topics": ["ml"], "capacity": 3}],
+    }
+    data = client.post("/assign", json=body).json()
+    cut = _assert_cut_invariants(data)
+    assert cut["max_assignable"] == 0
+    assert cut["shortfall"] == 1
+    assert cut["source_manuscripts"] == ["m1"]
+    for group in _CUT_GROUPS:
+        assert cut[group] == []
+
+
+def test_bottleneck_cut_track_capacity_zero():
+    """赛道限额 0：赛道节点在源侧、评审人在汇侧，0 容量赛道边跨割。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A",
+             "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 0}},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    cut = _assert_cut_invariants(data)
+    assert cut["max_assignable"] == 0
+    assert cut["shortfall"] == 1
+    assert cut["source_manuscripts"] == ["m1"]
+    assert cut["source_reviewer_tracks"] == [["r1", "A"]]
+    assert cut["source_reviewers"] == []
+    assert [(e["reviewer_id"], e["track"], e["capacity"])
+            for e in cut["track_capacity"]] == [("r1", "A", 0)]
+
+
+def test_bottleneck_cut_joint_track_and_total():
+    """赛道与总容量联立不可行：割由总容量边构成（割容量 3 < 需求 4）。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m3", "authors": [], "topics": ["t"], "track": "B"},
+            {"id": "m4", "authors": [], "topics": ["t"], "track": "B"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 3,
+             "track_capacities": {"A": 2, "B": 2}},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    cut = _assert_cut_invariants(data)
+    assert cut["max_assignable"] == 3
+    assert cut["shortfall"] == 1
+    assert cut["source_reviewer_tracks"] == [["r1", "A"], ["r1", "B"]]
+    assert [(e["reviewer_id"], e["capacity"])
+            for e in cut["reviewer_capacity"]] == [("r1", 3)]
+
+
+def test_bottleneck_cut_null_when_feasible_or_locked_conflict():
+    """可行时与锁定校验失败时，bottleneck_cut 必须为 null。"""
+    feasible = client.post("/assign", json={
+        "manuscripts": [{"id": "m1", "authors": [], "topics": ["t"],
+                         "required_reviewers": 1}],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 1}],
+    }).json()
+    assert feasible["status"] == "feasible"
+    assert feasible["bottleneck_cut"] is None
+
+    conflict = client.post("/assign", json={
+        "manuscripts": [{"id": "m1", "authors": [], "topics": ["ml"],
+                         "required_reviewers": 1}],
+        "reviewers": [{"id": "r2", "topics": ["db"], "capacity": 1}],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r2"]},
+        ],
+    }).json()
+    assert conflict["status"] == "infeasible"
+    assert conflict["locked_conflicts"] is not None
+    assert conflict["bottleneck_cut"] is None
+    assert conflict["unsatisfied"] is None
+
+
+def test_bottleneck_cut_incremental_with_valid_lock():
+    """合法锁定固化后仍不可行：割建在扣减锁定的残量网络上，容量含锁定名额。"""
+    body = {
+        "required_reviewers": 2,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"]},
+            {"id": "m2", "authors": [], "topics": ["t"]},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    cut = _assert_cut_invariants(data, locked_total=1)
+    # 1 个锁定名额 + 1 个剩余网络最大流 = 2；总需求 4，缺口 2
+    assert cut["max_assignable"] == 2
+    assert cut["shortfall"] == 2
+    # r1 的剩余总容量被锁定占满：跨割边容量为 0 仍显式列出
+    caps = {e["reviewer_id"]: e["capacity"] for e in cut["reviewer_capacity"]}
+    assert caps == {"r1": 0, "r2": 1}
+    assert data["unsatisfied"] is not None
+    assert data["shared_pool"] is not None
+
+
+def test_bottleneck_cut_incremental_track_edge():
+    """增量模式赛道剩余限额构成瓶颈：跨割边按剩余（扣锁定后）容量列出。"""
+    body = {
+        "required_reviewers": 1,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 1}},
+        ],
+        "previous_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    cut = _assert_cut_invariants(data)
+    assert cut["max_assignable"] == 1
+    assert cut["shortfall"] == 1
+    assert cut["source_reviewer_tracks"] == [["r1", "A"]]
+    assert [(e["reviewer_id"], e["track"], e["capacity"])
+            for e in cut["track_capacity"]] == [("r1", "A", 1)]
+
+
+def test_bottleneck_cut_order_independent():
+    """列表乱序不改变 bottleneck_cut 的输出。"""
+    body = {
+        "required_reviewers": 2,
+        "manuscripts": [
+            {"id": "m3", "authors": [], "topics": ["t"]},
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A"},
+            {"id": "m2", "authors": [], "topics": ["t"], "track": "A"},
+        ],
+        "reviewers": [
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+            {"id": "r1", "topics": ["t"], "capacity": 1,
+             "track_capacities": {"A": 1}},
+        ],
+    }
+    shuffled = {
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+        "required_reviewers": 2,
+    }
+    r1 = client.post("/assign", json=body).json()
+    r2 = client.post("/assign", json=shuffled).json()
+    assert r1["status"] == r2["status"] == "infeasible"
+    assert r1["bottleneck_cut"] == r2["bottleneck_cut"]
+
+
+def test_bottleneck_cut_random_instances_invariants():
+    """随机不可行实例（普通 + 增量模式，含合法锁定）：割容量恒等不变量必须始终成立。"""
+    rng = random.Random(2026)
+    topics = ["ml", "nlp", "cv"]
+    authors = [f"a{i}" for i in range(6)]
+    checked = {"normal": 0, "incremental": 0}
+    for seed in range(200):
+        sub = random.Random(seed)
+        body = {
+            "required_reviewers": rng.choice([1, 2]),
+            "manuscripts": [
+                {
+                    "id": f"m{i}",
+                    "authors": sub.sample(authors, sub.randint(0, 2)),
+                    "topics": sub.sample(topics, sub.randint(1, 2)),
+                    "required_reviewers": sub.randint(1, 3),
+                    **(
+                        {"track": sub.choice(["A", "B"])}
+                        if sub.random() < 0.5 else {}
+                    ),
+                }
+                for i in range(sub.randint(1, 5))
+            ],
+            "reviewers": [
+                {
+                    "id": f"r{j}",
+                    "topics": sub.sample(topics, sub.randint(1, 2)),
+                    # 小容量制造大量不可行实例
+                    "capacity": sub.randint(0, 2),
+                    "conflicted_authors": sub.sample(authors, sub.randint(0, 2)),
+                    **(
+                        {"track_capacities": {
+                            t: sub.randint(0, 2) for t in sub.sample(["A", "B"], 1)
+                        }}
+                        if sub.random() < 0.5 else {}
+                    ),
+                }
+                for j in range(sub.randint(1, 4))
+            ],
+        }
+
+        # 普通模式
+        data = client.post("/assign", json=body).json()
+        if data["status"] == "infeasible" and data["locked_conflicts"] is None:
+            _assert_cut_invariants(data)
+            checked["normal"] += 1
+
+        # 增量模式：从普通解中随机挑合法关系锁定（仅当普通解可行时可安全选取），
+        # 再抬高未锁定稿件的需求以进入「锁定合法但整体不可行」分支（锁定仍合法）
+        if data["status"] == "feasible" and data["assignments"]:
+            locks = []
+            locked_mids: set[str] = set()
+            for entry in data["assignments"]:
+                if sub.random() < 0.4 and entry["reviewer_ids"]:
+                    rid = sub.choice(entry["reviewer_ids"])
+                    locks.append({
+                        "manuscript_id": entry["manuscript_id"],
+                        "reviewer_ids": [rid],
+                    })
+                    locked_mids.add(entry["manuscript_id"])
+            if locks:
+                # 对所有未锁定稿件抬高需求：锁定仍合法，但总容量必然更紧，
+                # 稳定地进入「锁定合法但整体不可行」分支
+                grown = []
+                for m in body["manuscripts"]:
+                    m2 = dict(m)
+                    if m2["id"] not in locked_mids:
+                        m2["required_reviewers"] = m2.get(
+                            "required_reviewers", body["required_reviewers"]
+                        ) + sub.randint(2, 4)
+                    grown.append(m2)
+                req_body = {
+                    **body,
+                    "manuscripts": grown,
+                    "locked_assignments": locks,
+                    "previous_assignments": data["assignments"],
+                }
+                locked_n = len({
+                    (x["manuscript_id"], rid)
+                    for x in locks for rid in x["reviewer_ids"]
+                })
+                inc = client.post("/assign", json=req_body).json()
+                if (
+                    inc["status"] == "infeasible"
+                    and inc["locked_conflicts"] is None
+                ):
+                    _assert_cut_invariants(inc, locked_total=locked_n)
+                    checked["incremental"] += 1
+    assert checked["normal"] > 0
+    assert checked["incremental"] > 0
+

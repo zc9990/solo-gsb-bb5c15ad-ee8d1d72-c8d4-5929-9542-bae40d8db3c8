@@ -9,18 +9,26 @@ from .models import (
     AssignmentOut,
     AssignRequest,
     AssignResponse,
+    BottleneckCutEdgeOut,
+    BottleneckCutOut,
     LockedConflictOut,
     SharedPoolOut,
     UnsatisfiedOut,
 )
-from .solver import ManuscriptSpec, ReviewerSpec, solve_assignment
+from .solver import (
+    BottleneckCut,
+    ManuscriptSpec,
+    ReviewerSpec,
+    solve_assignment,
+)
 
 app = FastAPI(
     title="Anonymous Review Assignment API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "匿名评审分配服务：基于全局最大流（非逐稿贪心）求满足主题能力、"
-        "利益冲突与容量约束的完整分配；不可行时返回缺口诊断且不输出部分结果。"
+        "利益冲突与容量约束的完整分配；不可行时返回缺口诊断与全局最小割证明"
+        "（bottleneck_cut）且不输出部分结果。"
         "支持分赛道容量：稿件可声明 track，评审人可声明 track_capacities，"
         "赛道限额与总容量在同一流网络中联立求解。"
         "支持增量重排：携带 previous_assignments / locked_assignments 时，"
@@ -53,6 +61,23 @@ def _to_pair_set(
         return None
     return frozenset(
         (a.manuscript_id, rid) for a in items for rid in set(a.reviewer_ids)
+    )
+
+
+def _to_bottleneck_cut_out(cut: BottleneckCut) -> BottleneckCutOut:
+    def edges(group) -> list[BottleneckCutEdgeOut]:
+        return [BottleneckCutEdgeOut(**vars(e)) for e in group]
+
+    return BottleneckCutOut(
+        source_manuscripts=list(cut.source_manuscripts),
+        source_reviewer_tracks=[list(pair) for pair in cut.source_reviewer_tracks],
+        source_reviewers=list(cut.source_reviewers),
+        demand=edges(cut.demand),
+        eligibility=edges(cut.eligibility),
+        track_capacity=edges(cut.track_capacity),
+        reviewer_capacity=edges(cut.reviewer_capacity),
+        max_assignable=cut.max_assignable,
+        shortfall=cut.shortfall,
     )
 
 
@@ -132,4 +157,9 @@ def assign(req: AssignRequest) -> AssignResponse:
         unsatisfied=[UnsatisfiedOut(**vars(u)) for u in result.unsatisfied],
         shared_pool=SharedPoolOut(**result.shared_pool) if result.shared_pool else None,
         locked_conflicts=None,
+        bottleneck_cut=(
+            _to_bottleneck_cut_out(result.bottleneck_cut)
+            if result.bottleneck_cut
+            else None
+        ),
     )

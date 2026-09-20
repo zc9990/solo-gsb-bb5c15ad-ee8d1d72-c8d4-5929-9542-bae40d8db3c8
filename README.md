@@ -10,7 +10,10 @@
 - 评审人声明了某赛道限额时，其在该赛道上的分配量不超过对应限额
   （赛道限额与总容量在同一流网络中联立求解，而非分赛道独立求解后拼接）。
 
-无可行解时返回未满足稿件及候选/容量缺口诊断，**不输出任何部分分配结果**；
+无可行解时返回未满足稿件及候选/容量缺口诊断，并在求解结束的残量网络上给出
+**全局最小割证明**（`bottleneck_cut`：源侧节点 + 按 `demand` / `eligibility` /
+`track_capacity` / `reviewer_capacity` 分类的跨割饱和边 + `max_assignable` 与
+`shortfall`），**不输出任何部分分配结果**；
 相同输入（甚至不同的列表顺序）必然产生完全相同的输出。服务无状态，不持久化任何数据。
 
 请求携带 `previous_assignments` / `locked_assignments` 时进入**增量重排模式**：
@@ -107,7 +110,8 @@ docker run -p 8000:8000 review-assign
   ],
   "unsatisfied": null,
   "shared_pool": null,
-  "locked_conflicts": null
+  "locked_conflicts": null,
+  "bottleneck_cut": null
 }
 ```
 
@@ -138,7 +142,21 @@ docker run -p 8000:8000 review-assign
     "pool_remaining_capacity": 0,
     "pool_total_capacity": 2
   },
-  "locked_conflicts": null
+  "locked_conflicts": null,
+  "bottleneck_cut": {
+    "source_manuscripts": ["m1", "m2"],
+    "source_reviewer_tracks": [],
+    "source_reviewers": ["r1", "r2"],
+    "demand": [],
+    "eligibility": [],
+    "track_capacity": [],
+    "reviewer_capacity": [
+      {"type": "reviewer_capacity", "capacity": 1, "manuscript_id": null, "reviewer_id": "r1", "track": null},
+      {"type": "reviewer_capacity", "capacity": 1, "manuscript_id": null, "reviewer_id": "r2", "track": null}
+    ],
+    "max_assignable": 2,
+    "shortfall": 2
+  }
 }
 ```
 
@@ -150,6 +168,57 @@ docker run -p 8000:8000 review-assign
 - `candidate_gap`：候选人数缺口（`required - eligible_reviewers`，候选本身不足）；
 - `capacity_gap`：容量缺口（`missing - eligible_remaining_capacity`，候选够但容量不足）；
 - `shared_pool`：所有未满足稿件共享的候选池及其总/剩余容量，用于定位整体瓶颈。
+
+#### `bottleneck_cut`：不可行的全局最小割证明
+
+最大流结束后，从源点沿**残量容量大于 0** 的边可达的节点构成源侧集合 `S`；由
+最大流最小割定理，所有 `S → 非 S` 的正向边恰好全部饱和，其容量之和（割容量）
+等于最大流——即在主题、冲突、赛道限额与总容量全部约束下**至多可满足的名额数**
+`max_assignable`，`shortfall = total_required - max_assignable` 为严格缺口下界。
+
+- `source_manuscripts` / `source_reviewers`：源侧的稿件 / 评审人业务 ID（按 ID 排序）；
+- `source_reviewer_tracks`：源侧的「(评审人, 赛道)」限额节点，二元组
+  `[reviewer_id, track]`，按业务 ID 排序；
+- 跨割饱和边按业务含义分四组列出（组内按业务 ID 确定排序，列表乱序输出不变）：
+
+| 分组 | 边 | 携带字段 |
+| --- | --- | --- |
+| `demand` | 源 → 稿件（该稿需求整体跨割） | `manuscript_id`, `capacity` |
+| `eligibility` | 稿件 → 评审人 / (评审人,赛道) 节点（合格关系构成的 Hall 型瓶颈） | `manuscript_id`, `reviewer_id`, `track`（走赛道节点时）, `capacity` |
+| `track_capacity` | (评审人,赛道) → 评审人（赛道限额饱和，含限额为 0 的边） | `reviewer_id`, `track`, `capacity` |
+| `reviewer_capacity` | 评审人 → 汇（评审总容量饱和） | `reviewer_id`, `capacity` |
+
+示例：
+
+- 总容量不足时，割边全在 `reviewer_capacity`（如上方示例，割容量 2 = 至多 2 个名额）；
+- 合格候选不足时，割边出现在 `eligibility`：下例割容量为 1（唯一合格关系 `m1→r1`），
+  证明 2 个名额至多满足 1 个；
+
+```json
+{
+  "bottleneck_cut": {
+    "source_manuscripts": ["m1"],
+    "source_reviewer_tracks": [],
+    "source_reviewers": [],
+    "demand": [],
+    "eligibility": [
+      {"type": "eligibility", "capacity": 1, "manuscript_id": "m1", "reviewer_id": "r1", "track": null}
+    ],
+    "track_capacity": [],
+    "reviewer_capacity": [],
+    "max_assignable": 1,
+    "shortfall": 1
+  }
+}
+```
+
+- 赛道限额为 0 时，赛道节点在源侧、评审人在汇侧，`track_capacity` 中列出容量 0 的饱和边。
+
+**增量重排模式**下，合法锁定关系先固化（扣减稿件剩余需求、评审剩余总容量与剩余
+赛道限额），瓶颈割建在该「扣除锁定占用后的残量网络」上：各边 `capacity` 为扣除
+锁定后的**剩余**容量（因此可能为 0），割容量等于剩余网络最大流；`max_assignable`
+为**合法锁定名额 + 割容量**（即含锁定关系在内全局至多可满足的名额数）。锁定关系
+校验失败时不进行求解，`bottleneck_cut` 为 `null`（只返回 `locked_conflicts`）。
 
 ### 增量重排模式（可选）
 
@@ -208,7 +277,8 @@ docker run -p 8000:8000 review-assign
   ],
   "unsatisfied": null,
   "shared_pool": null,
-  "locked_conflicts": null
+  "locked_conflicts": null,
+  "bottleneck_cut": null
 }
 ```
 
@@ -232,7 +302,8 @@ docker run -p 8000:8000 review-assign
       "track": null,
       "detail": "评审人 r1 被锁定 3 篇稿件，超出其容量 2"
     }
-  ]
+  ],
+  "bottleneck_cut": null
 }
 ```
 
@@ -250,7 +321,9 @@ docker run -p 8000:8000 review-assign
 | `manuscript_requirement_exceeded` | 稿件锁定人数超出所需评审数（`locked` / `limit` 给出数值） |
 
 增量模式下若锁定关系全部合法但整体仍不可行（容量/候选不足），响应与普通模式
-不可行情形相同：`unsatisfied` + `shared_pool` 缺口诊断，`locked_conflicts` 为 `null`。
+不可行情形相同：`unsatisfied` + `shared_pool` 缺口诊断，`locked_conflicts` 为
+`null`，并同样给出 `bottleneck_cut` 最小割证明（割边容量为扣除合法锁定占用后的
+剩余容量，`max_assignable` 含已固化的锁定名额）。
 
 ### 分赛道容量（可选）
 
@@ -289,7 +362,8 @@ docker run -p 8000:8000 review-assign
   ],
   "unsatisfied": null,
   "shared_pool": null,
-  "locked_conflicts": null
+  "locked_conflicts": null,
+  "bottleneck_cut": null
 }
 ```
 
@@ -327,7 +401,8 @@ docker run -p 8000:8000 review-assign
       "track": "poster",
       "detail": "评审人 r1 在赛道 poster 被锁定 2 篇稿件，超出其赛道限额 1"
     }
-  ]
+  ],
+  "bottleneck_cut": null
 }
 ```
 
@@ -406,9 +481,14 @@ curl -s -X POST http://localhost:8000/assign \
   `previous_assignments` 的边费用为 0、新增边费用为 1，流量固定时费用最小即复用最多，
   亦即新增 + 移除关系总数最少；复用边同样流经赛道限额节点，历史关系仅在两级容量
   均允许时复用。
+- 不可行证明：求解结束后在残量网络上从源点 BFS 得到源侧集合，跨割的正向边必然全部
+  饱和；由最大流最小割定理，按 `demand` / `eligibility` / `track_capacity` /
+  `reviewer_capacity` 分类列出的跨割边容量之和即割容量 = `max_assignable`，
+  `shortfall` 为总需求与之差。增量模式下该割建在扣除合法锁定占用后的残量网络上，
+  `max_assignable` 再加上已固化的锁定名额；锁定校验失败时不给该证明。
 - 所有节点按 ID 排序后建图，BFS / Dijkstra 均按固定邻接顺序与 (费用, 节点下标) 字典序
   执行，算法无随机性：相同输入（含不同的列表顺序）产生逐字节相同的输出，
-  同成本解由 ID 顺序确定性地破除。
+  同成本解由 ID 顺序确定性地破除（瓶颈割的节点与边同样按业务 ID 确定排序）。
 
 ## 本地开发与测试
 

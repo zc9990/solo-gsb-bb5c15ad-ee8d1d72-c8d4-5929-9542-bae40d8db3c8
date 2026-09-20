@@ -144,6 +144,45 @@ class LockedConflictOut(BaseModel):
     detail: str
 
 
+class BottleneckCutEdgeOut(BaseModel):
+    """一条跨越瓶颈割（源侧 -> 汇侧）的饱和边。"""
+
+    # demand：源 -> 稿件（稿件需求）；eligibility：稿件 -> 评审人/赛道节点（评审资格）；
+    # track_capacity：(评审人,赛道) -> 评审人（赛道限额）；
+    # reviewer_capacity：评审人 -> 汇（评审总容量）
+    type: Literal[
+        "demand",
+        "eligibility",
+        "track_capacity",
+        "reviewer_capacity",
+    ]
+    # 建图容量（增量模式下为扣除合法锁定占用后的剩余容量）
+    capacity: int
+    manuscript_id: str | None = None
+    reviewer_id: str | None = None
+    # eligibility 走赛道节点 / track_capacity 边时携带赛道名
+    track: str | None = None
+
+
+class BottleneckCutOut(BaseModel):
+    """不可行的全局最小割证明（求解结束的残量网络上，割容量 = 最大流）。"""
+
+    # 残量网络中从源点可达（源侧）的业务节点，按业务 ID 排序
+    source_manuscripts: list[str]
+    # (评审人 ID, 赛道名) 二元组，按业务 ID 排序
+    source_reviewer_tracks: list[list[str]]
+    source_reviewers: list[str]
+    # 跨割饱和边，按类型分组、组内按业务 ID 确定排序
+    demand: list[BottleneckCutEdgeOut]
+    eligibility: list[BottleneckCutEdgeOut]
+    track_capacity: list[BottleneckCutEdgeOut]
+    reviewer_capacity: list[BottleneckCutEdgeOut]
+    # 割容量：全部约束下至多可满足的名额数（增量模式含已固化的合法锁定名额）
+    max_assignable: int
+    # 总需求 - max_assignable
+    shortfall: int
+
+
 class AssignResponse(BaseModel):
     status: Literal["feasible", "infeasible"]
     total_required: int
@@ -155,3 +194,5 @@ class AssignResponse(BaseModel):
     shared_pool: SharedPoolOut | None
     # 锁定关系冲突（仅增量重排模式且锁定不可行时非空）；否则为 null
     locked_conflicts: list[LockedConflictOut] | None = None
+    # 合法但剩余需求无法满足时的全局最小割证明；可行或锁定校验失败时为 null
+    bottleneck_cut: BottleneckCutOut | None = None
