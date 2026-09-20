@@ -29,6 +29,20 @@ track 时仍走 稿件->评审人 直边，只受总容量约束。
   关系总数最少；复用边同样流经赛道限额节点，历史关系仅在两级容量均允许时复用；
 - 增广路按 (费用, 节点下标) 字典序选取，节点下标来自 ID 排序：
   同成本解由 ID 顺序确定性地破除，输出完全确定。
+
+不可行证明（普通最大流与增量最小费用流一致）：
+
+- 最大流结束后在残量网络中从源点做 BFS 得到可达集合 S（残量容量 > 0 的边，
+  含反向边）；由最大流最小割定理，(S, V\\S) 即一条 s-t 最小割，跨割正向边
+  全部饱和、容量之和等于最大流，因此该割本身就是「最多只能分配这么多」的
+  不可行性证书，不依赖任何部分分配结果；
+- 跨割饱和边按业务含义分为 demand / eligibility / track_capacity /
+  reviewer_capacity 四类，源侧节点分为稿件、评审人与 (评审人, 赛道) 节点，
+  全部按业务 ID 排序，与输入列表顺序无关；
+- 增量模式下割建立在锁定固化后的残量网络上（容量为剩余需求 / 剩余总容量 /
+  剩余赛道限额），跨割饱和边容量之和等于锁定之外还能完成的最大分配数，
+  max_assignable 再计入必然保留的锁定关系，shortfall 按业务总需求给出。
+- 锁定关系校验失败时不建流网络，bottleneck_cut 为 None。
 """
 
 from __future__ import annotations
@@ -98,6 +112,17 @@ class SolveResult:
     shared_pool: dict | None
     # 锁定关系冲突（增量重排模式）；无冲突或普通模式时为空
     locked_conflicts: tuple[LockedConflict, ...] = ()
+    # 不可行（剩余需求无法满足）时基于残量网络的全局最小割证明；
+    # 可行或锁定关系校验失败时为 None
+    bottleneck_cut: dict | None = None
+
+
+# 最小割跨割饱和边的四类业务含义：
+#   demand           —— 源点 -> 稿件（容量=稿件需求；增量模式为扣除锁定后的剩余需求）
+#   eligibility      —— 稿件 -> 评审人 / (评审人, 赛道)（容量 1，仅评审资格合格时建边）
+#   track_capacity   —— (评审人, 赛道) -> 评审人（容量=赛道限额；增量模式为剩余限额）
+#   reviewer_capacity —— 评审人 -> 汇点（容量=总容量；增量模式为扣除锁定后的剩余容量）
+_CUT_TYPES = ("demand", "eligibility", "track_capacity", "reviewer_capacity")
 
 
 class _MaxFlow:
@@ -144,6 +169,21 @@ class _MaxFlow:
                 v = u
             flow += bottleneck
 
+    def reachable_from(self, s: int) -> set[int]:
+        """最大流结束后沿残余容量（cap > 0，含反向边）从 s 可达的节点集合。
+
+        由最大流最小割定理，该集合的边界即一条 s-t 最小割，跨割边全部饱和。
+        """
+        seen = {s}
+        q = deque([s])
+        while q:
+            u = q.popleft()
+            for v in self.adj[u]:
+                if v not in seen and self.cap[u][v] > 0:
+                    seen.add(v)
+                    q.append(v)
+        return seen
+
 
 class _MinCostMaxFlow:
     """SSP 最小费用最大流（初始费用非负，Dijkstra + 势函数）。
@@ -173,6 +213,21 @@ class _MinCostMaxFlow:
         """正向边 (u, ei) 上的流量（即反向边的残余容量）。"""
         e = self.g[u][ei]
         return self.g[e[0]][e[3]][1]
+
+    def reachable_from(self, s: int) -> set[int]:
+        """最小费用最大流结束后沿残余容量 > 0 的边（含反向边）从 s 可达的节点集合。
+
+        由最大流最小割定理，该集合的边界即一条 s-t 最小割，跨割正向边全部饱和。
+        """
+        seen = {s}
+        q = deque([s])
+        while q:
+            u = q.popleft()
+            for e in self.g[u]:
+                if e[1] > 0 and e[0] not in seen:
+                    seen.add(e[0])
+                    q.append(e[0])
+        return seen
 
     def min_cost_max_flow(self, s: int, t: int) -> tuple[int, int]:
         n = self.n
@@ -267,6 +322,118 @@ def _pair_ineligibility_reasons(m: ManuscriptSpec, r: ReviewerSpec) -> tuple[str
     return tuple(reasons)
 
 
+def _build_bottleneck_cut(
+    ms: list[ManuscriptSpec],
+    rs: list[ReviewerSpec],
+    track_nodes: list[dict[str, int]],
+    reachable: set[int],
+    # 业务边登记表：(类型, 起点, 终点, 原始业务容量, 流量, 业务标识)
+    # 标识按类型分别为：
+    #   demand            -> (manuscript_id,)
+    #   eligibility       -> (manuscript_id, reviewer_id, track or None)
+    #   track_capacity    -> (reviewer_id, track)
+    #   reviewer_capacity -> (reviewer_id,)
+    registry: list[tuple[str, int, int, int, int, tuple]],
+    max_assignable: int,
+    total_required: int,
+) -> dict:
+    """根据最大流结束后的残量可达集合构造 s-t 最小割（瓶颈割）证明。
+
+    reachable 即残量网络中源点可达的节点集合 S；由最大流最小割定理，从 S 跨向
+    S 外的正向业务边全部饱和，其容量之和恰为最大流（max_assignable）。
+
+    增量模式下登记的容量/流量均为锁定固化扣减后的残量网络口径（剩余需求、
+    剩余总容量、剩余赛道限额）；max_assignable / shortfall 仍为业务总量口径
+    （已计入必然保留的锁定关系）。
+    """
+    m_node_ids = {1 + i: ms[i].id for i in range(len(ms))}
+    r_node_ids = {1 + len(ms) + j: rs[j].id for j in range(len(rs))}
+    track_node_ids: dict[int, tuple[str, str]] = {}
+    for j, nodes in enumerate(track_nodes):
+        for track, node in nodes.items():
+            track_node_ids[node] = (rs[j].id, track)
+
+    side_manuscripts = sorted(
+        m_node_ids[u] for u in reachable if u in m_node_ids
+    )
+    side_reviewers = sorted(
+        r_node_ids[u] for u in reachable if u in r_node_ids
+    )
+    side_track_nodes: list[dict] = []
+    for node in reachable:
+        item = track_node_ids.get(node)
+        if item is not None:
+            rid, track = item
+            side_track_nodes.append({"reviewer_id": rid, "track": track})
+    side_track_nodes.sort(key=lambda e: (e["reviewer_id"], e["track"]))
+
+    buckets: dict[str, list[dict]] = {t: [] for t in _CUT_TYPES}
+    for etype, u, v, capacity, flow, key in registry:
+        if u in reachable and v not in reachable:
+            # 最小割跨割边必然饱和；断言以防止登记表/残量口径不一致
+            assert flow == capacity, (
+                f"bottleneck cut cross edge not saturated: {etype} {key} "
+                f"flow={flow} capacity={capacity}"
+            )
+            if etype == "demand":
+                (mid,) = key
+                edge = {
+                    "manuscript_id": mid,
+                    "capacity": capacity,
+                    "flow": flow,
+                }
+            elif etype == "eligibility":
+                mid, rid, track = key
+                edge = {
+                    "manuscript_id": mid,
+                    "reviewer_id": rid,
+                    "track": track,
+                    "capacity": capacity,
+                    "flow": flow,
+                }
+            elif etype == "track_capacity":
+                rid, track = key
+                edge = {
+                    "reviewer_id": rid,
+                    "track": track,
+                    "capacity": capacity,
+                    "flow": flow,
+                }
+            else:
+                (rid,) = key
+                edge = {
+                    "reviewer_id": rid,
+                    "capacity": capacity,
+                    "flow": flow,
+                }
+            buckets[etype].append(edge)
+
+    buckets["demand"].sort(key=lambda e: e["manuscript_id"])
+    buckets["eligibility"].sort(
+        key=lambda e: (e["manuscript_id"], e["reviewer_id"], e["track"] or "")
+    )
+    buckets["track_capacity"].sort(
+        key=lambda e: (e["reviewer_id"], e["track"])
+    )
+    buckets["reviewer_capacity"].sort(key=lambda e: e["reviewer_id"])
+
+    return {
+        "source_side": {
+            "manuscript_ids": side_manuscripts,
+            "reviewer_ids": side_reviewers,
+            "reviewer_track_nodes": side_track_nodes,
+        },
+        "saturated_edges": {
+            "demand": buckets["demand"],
+            "eligibility": buckets["eligibility"],
+            "track_capacity": buckets["track_capacity"],
+            "reviewer_capacity": buckets["reviewer_capacity"],
+        },
+        "max_assignable": max_assignable,
+        "shortfall": total_required - max_assignable,
+    }
+
+
 def solve_assignment(
     manuscripts: list[ManuscriptSpec],
     reviewers: list[ReviewerSpec],
@@ -336,15 +503,38 @@ def _solve_normal(ms: list[ManuscriptSpec], rs: list[ReviewerSpec]) -> SolveResu
     eligible = [_eligible_reviewers(m, rs) for m in ms]
 
     mf = _MaxFlow(SNK + 1)
+    # 业务边登记表（与实际建图一一对应；容量 0 的赛道边不建图但仍登记，
+    # 用于在最小割证明中暴露“该赛道限额本身为 0”这一瓶颈）：
+    # (类型, 起点, 终点, 原始容量, 业务标识)
+    registry0: list[tuple[str, int, int, int, tuple]] = []
     for i, m in enumerate(ms):
         mf.add_edge(SRC, m_node(i), m.required_reviewers)
+        registry0.append(
+            ("demand", SRC, m_node(i), m.required_reviewers, (m.id,))
+        )
     for i in range(m_count):
         for j in eligible[i]:
-            mf.add_edge(m_node(i), mr_target(i, j), 1)
+            target = mr_target(i, j)
+            mf.add_edge(m_node(i), target, 1)
+            track = ms[i].track if target != r_node(j) else None
+            registry0.append((
+                "eligibility",
+                m_node(i),
+                target,
+                1,
+                (ms[i].id, rs[j].id, track),
+            ))
     for j, r in enumerate(rs):
         for track, node in track_nodes[j].items():
-            mf.add_edge(node, r_node(j), track_caps[j][track])
+            cap = track_caps[j][track]
+            mf.add_edge(node, r_node(j), cap)
+            registry0.append((
+                "track_capacity", node, r_node(j), cap, (r.id, track)
+            ))
         mf.add_edge(r_node(j), SNK, r.capacity)
+        registry0.append((
+            "reviewer_capacity", r_node(j), SNK, r.capacity, (r.id,)
+        ))
 
     total_required = sum(m.required_reviewers for m in ms)
     total_assigned = mf.max_flow(SRC, SNK)
@@ -416,6 +606,18 @@ def _solve_normal(ms: list[ManuscriptSpec], rs: list[ReviewerSpec]) -> SolveResu
         "pool_total_capacity": sum(rs[j].capacity for j in pool),
     }
 
+    # 全局最小割证明：残量网络源侧节点 + 跨割饱和边（按业务含义分类）
+    reachable = mf.reachable_from(SRC)
+    registry: list[tuple[str, int, int, int, int, tuple]] = [
+        (etype, u, v, cap, mf.cap[v][u], key)
+        for etype, u, v, cap, key in registry0
+    ]
+    bottleneck_cut = _build_bottleneck_cut(
+        ms, rs, track_nodes, reachable, registry,
+        max_assignable=total_assigned,
+        total_required=total_required,
+    )
+
     return SolveResult(
         feasible=False,
         assignments={},
@@ -423,6 +625,7 @@ def _solve_normal(ms: list[ManuscriptSpec], rs: list[ReviewerSpec]) -> SolveResu
         total_assigned=total_assigned,
         unsatisfied=tuple(unsatisfied),
         shared_pool=shared_pool,
+        bottleneck_cut=bottleneck_cut,
     )
 
 
@@ -581,9 +784,13 @@ def _solve_incremental(
     # 复用边同样流经 (评审人, 赛道) 限额节点与总容量边：
     # 历史关系仅在两级容量均允许时才会被复用。
     mf = _MinCostMaxFlow(SNK + 1)
+    # 业务边登记表（容量均为锁定固化扣减后的残量网络口径）：
+    # (类型, 起点, 终点, 正向边下标, 原始容量, 业务标识)
+    demand_edge_idx: list[tuple[int, int, int]] = []  # (稿件下标, 边下标, 剩余需求)
     for i, m in enumerate(ms):
         remaining_req = m.required_reviewers - len(locked_map.get(m.id, ()))
-        mf.add_edge(SRC, m_node(i), remaining_req, 0)
+        ei = mf.add_edge(SRC, m_node(i), remaining_req, 0)
+        demand_edge_idx.append((i, ei, remaining_req))
     mr_edges: list[tuple[int, int, int]] = []  # (稿件下标, 边下标, 评审下标)
     for i, m in enumerate(ms):
         for j in eligible[i]:
@@ -675,6 +882,47 @@ def _solve_incremental(
         "pool_total_capacity": sum(rs[j].capacity for j in pool),
     }
 
+    # 全局最小割证明（锁定合法但剩余需求无法满足）：
+    # 割边容量/流量为扣除锁定占用后的残量网络口径；max_assignable 计入必然
+    # 保留的锁定关系，shortfall 按业务总需求计算。
+    registry: list[tuple[str, int, int, int, int, tuple]] = []
+    for i, ei, remaining_req in demand_edge_idx:
+        registry.append((
+            "demand", SRC, m_node(i), remaining_req,
+            mf.flow_on(SRC, ei), (ms[i].id,),
+        ))
+    for i, ei, j in mr_edges:
+        target = mr_target(i, j)
+        track = ms[i].track if target != r_node(j) else None
+        registry.append((
+            "eligibility", m_node(i), target, 1,
+            mf.flow_on(m_node(i), ei),
+            (ms[i].id, rs[j].id, track),
+        ))
+    for j in range(r_count):
+        for track, node in track_nodes[j].items():
+            ei = track_edge_idx[j][track]
+            remaining_track = track_caps[j][track] - locked_track_count_r.get(
+                rs[j].id, {}
+            ).get(track, 0)
+            registry.append((
+                "track_capacity", node, r_node(j), remaining_track,
+                mf.flow_on(node, ei), (rs[j].id, track),
+            ))
+        ei = r_edge_idx[j]
+        remaining_cap = rs[j].capacity - locked_count_r.get(rs[j].id, 0)
+        registry.append((
+            "reviewer_capacity", r_node(j), SNK, remaining_cap,
+            mf.flow_on(r_node(j), ei), (rs[j].id,),
+        ))
+
+    reachable = mf.reachable_from(SRC)
+    bottleneck_cut = _build_bottleneck_cut(
+        ms, rs, track_nodes, reachable, registry,
+        max_assignable=total_assigned,
+        total_required=total_required,
+    )
+
     return SolveResult(
         feasible=False,
         assignments={},
@@ -682,4 +930,5 @@ def _solve_incremental(
         total_assigned=total_assigned,
         unsatisfied=tuple(unsatisfied),
         shared_pool=shared_pool,
+        bottleneck_cut=bottleneck_cut,
     )

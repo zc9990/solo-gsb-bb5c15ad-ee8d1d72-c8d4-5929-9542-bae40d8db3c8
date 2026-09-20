@@ -211,6 +211,24 @@ def test_infeasible_capacity_gap():
     assert pool["pool_total_capacity"] == 2
     assert sorted(pool["reviewer_ids"]) == ["r1", "r2"]
 
+    # 全局最小割证明：源侧含两篇稿件与两名评审，跨割饱和边是两条评审总容量边，
+    # 容量之和 = 最大流 = max_assignable
+    cut = data["bottleneck_cut"]
+    assert cut["max_assignable"] == 2
+    assert cut["shortfall"] == 2
+    assert cut["source_side"]["manuscript_ids"] == ["m1", "m2"]
+    assert cut["source_side"]["reviewer_ids"] == ["r1", "r2"]
+    assert cut["source_side"]["reviewer_track_nodes"] == []
+    edges = cut["saturated_edges"]
+    assert edges["demand"] == []
+    assert edges["eligibility"] == []
+    assert edges["track_capacity"] == []
+    assert {(e["reviewer_id"], e["capacity"], e["flow"]) for e in edges["reviewer_capacity"]} == {
+        ("r1", 1, 1), ("r2", 1, 1)
+    }
+    # 排序确定性
+    assert [e["reviewer_id"] for e in edges["reviewer_capacity"]] == ["r1", "r2"]
+
 
 def test_infeasible_candidate_gap():
     """候选人数不足：m1 需 2 人，但 r2 与作者存在利益冲突。"""
@@ -249,6 +267,168 @@ def test_infeasible_no_eligible_reviewer_at_all():
     assert u["eligible_reviewers"] == 0
     assert u["candidate_gap"] == 1
     assert data["shared_pool"]["reviewer_ids"] == []
+
+    # 割内仅剩孤立的稿件节点，不存在跨割边：退化的空割即 max_assignable=0 的证明
+    cut = data["bottleneck_cut"]
+    assert cut["source_side"] == {
+        "manuscript_ids": ["m1"],
+        "reviewer_ids": [],
+        "reviewer_track_nodes": [],
+    }
+    assert cut["saturated_edges"] == {
+        "demand": [],
+        "eligibility": [],
+        "track_capacity": [],
+        "reviewer_capacity": [],
+    }
+    assert cut["max_assignable"] == 0
+    assert cut["shortfall"] == 1
+
+
+def test_bottleneck_cut_eligibility_edge():
+    """候选人数不足时，饱和跨割边是资格边（m -> r），track 为 null。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": ["alice"], "topics": ["ml"],
+             "required_reviewers": 2},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["ml"], "capacity": 5},
+            {"id": "r2", "topics": ["ml"], "capacity": 5,
+             "conflicted_authors": ["alice"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    cut = data["bottleneck_cut"]
+    assert cut["source_side"]["manuscript_ids"] == ["m1"]
+    assert cut["source_side"]["reviewer_ids"] == []
+    assert cut["saturated_edges"]["eligibility"] == [
+        {"manuscript_id": "m1", "reviewer_id": "r1", "track": None,
+         "capacity": 1, "flow": 1}
+    ]
+    assert cut["saturated_edges"]["reviewer_capacity"] == []
+    assert cut["saturated_edges"]["track_capacity"] == []
+    assert cut["saturated_edges"]["demand"] == []
+    assert cut["max_assignable"] == 1
+    assert cut["shortfall"] == 1
+
+
+def test_bottleneck_cut_track_capacity_zero_edge():
+    """赛道限额为 0：跨割饱和边是 (评审人,赛道)->评审人 边，容量 0。"""
+    body = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "track": "A",
+             "required_reviewers": 1},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 5,
+             "track_capacities": {"A": 0}},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    cut = data["bottleneck_cut"]
+    assert cut["source_side"]["manuscript_ids"] == ["m1"]
+    assert cut["source_side"]["reviewer_ids"] == []
+    assert cut["source_side"]["reviewer_track_nodes"] == [
+        {"reviewer_id": "r1", "track": "A"}
+    ]
+    assert cut["saturated_edges"]["track_capacity"] == [
+        {"reviewer_id": "r1", "track": "A", "capacity": 0, "flow": 0}
+    ]
+    assert cut["max_assignable"] == 0
+    assert cut["shortfall"] == 1
+
+
+def test_bottleneck_cut_null_on_feasible_and_locked_conflict():
+    body_feasible = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"], "required_reviewers": 1},
+        ],
+        "reviewers": [{"id": "r1", "topics": ["t"], "capacity": 1}],
+    }
+    assert client.post("/assign", json=body_feasible).json()["bottleneck_cut"] is None
+
+    body_locked = {
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["ml"], "required_reviewers": 1},
+        ],
+        "reviewers": [{"id": "r2", "topics": ["db"], "capacity": 1}],
+        "locked_assignments": [{"manuscript_id": "m1", "reviewer_ids": ["r2"]}],
+    }
+    data = client.post("/assign", json=body_locked).json()
+    assert data["status"] == "infeasible"
+    assert data["bottleneck_cut"] is None
+    assert data["locked_conflicts"][0]["type"] == "topic_mismatch"
+
+
+def test_bottleneck_cut_incremental_uses_residual_capacities():
+    """增量模式：锁定合法但剩余需求不可行时，割边容量为扣除锁定后的剩余口径，
+    max_assignable 计入必然保留的锁定关系。"""
+    body = {
+        "required_reviewers": 2,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"]},
+            {"id": "m2", "authors": [], "topics": ["t"]},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+        ],
+        "previous_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+        "locked_assignments": [
+            {"manuscript_id": "m1", "reviewer_ids": ["r1"]},
+        ],
+    }
+    data = client.post("/assign", json=body).json()
+    assert data["status"] == "infeasible"
+    assert data["locked_conflicts"] is None
+    assert data["assignments"] is None
+    cut = data["bottleneck_cut"]
+    # 锁定 1 条必然保留，残量网最多再分配 1 条 -> max_assignable=2，缺口 2
+    assert cut["max_assignable"] == 2
+    assert cut["shortfall"] == 2
+    assert data["total_assigned"] == 2
+    rc = {e["reviewer_id"]: e for e in cut["saturated_edges"]["reviewer_capacity"]}
+    # 容量均为扣除锁定后的剩余口径：r1 剩余 0（经反向残余边仍可达，故成为
+    # 容量 0 的跨割饱和边），r2 剩余 1 且被残量流占满
+    assert rc["r1"] == {"reviewer_id": "r1", "capacity": 0, "flow": 0}
+    assert rc["r2"] == {"reviewer_id": "r2", "capacity": 1, "flow": 1}
+
+
+def test_bottleneck_cut_order_independent():
+    """割证明的节点与边按业务 ID 排序，输入列表乱序不改变输出。"""
+    body = {
+        "required_reviewers": 2,
+        "manuscripts": [
+            {"id": "m1", "authors": [], "topics": ["t"]},
+            {"id": "m2", "authors": [], "topics": ["t"]},
+            {"id": "m3", "authors": [], "topics": ["t"]},
+        ],
+        "reviewers": [
+            {"id": "r1", "topics": ["t"], "capacity": 1},
+            {"id": "r2", "topics": ["t"], "capacity": 1},
+            {"id": "r3", "topics": ["t"], "capacity": 1},
+        ],
+    }
+    r1 = client.post("/assign", json=body).json()
+    shuffled = {
+        "manuscripts": list(reversed(body["manuscripts"])),
+        "reviewers": list(reversed(body["reviewers"])),
+        "required_reviewers": 2,
+    }
+    r2 = client.post("/assign", json=shuffled).json()
+    assert r1["status"] == r2["status"] == "infeasible"
+    assert r1["bottleneck_cut"] == r2["bottleneck_cut"]
+    cut = r1["bottleneck_cut"]
+    assert cut["source_side"]["manuscript_ids"] == ["m1", "m2", "m3"]
+    assert [e["reviewer_id"] for e in cut["saturated_edges"]["reviewer_capacity"]] == [
+        "r1", "r2", "r3"
+    ]
+
 
 
 def test_self_conflict_excluded():
@@ -707,6 +887,15 @@ def test_track_and_total_capacity_solved_jointly():
     assert data["assignments"] is None
     assert data["total_required"] == 4
     assert data["total_assigned"] == 3
+    # 最小割证明：总容量边 r1->汇 饱和（容量 3），两条赛道限额均未饱和
+    cut = data["bottleneck_cut"]
+    assert cut["max_assignable"] == 3
+    assert cut["shortfall"] == 1
+    assert cut["source_side"]["reviewer_ids"] == ["r1"]
+    assert cut["saturated_edges"]["track_capacity"] == []
+    assert cut["saturated_edges"]["reviewer_capacity"] == [
+        {"reviewer_id": "r1", "capacity": 3, "flow": 3}
+    ]
 
 
 def test_unlisted_track_only_total_capacity():

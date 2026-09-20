@@ -144,6 +144,79 @@ class LockedConflictOut(BaseModel):
     detail: str
 
 
+class _CutEdgeBase(BaseModel):
+    # 跨割饱和边的原始容量与实际流量（最小割跨割边必有 flow == capacity）
+    capacity: int
+    flow: int
+
+
+class DemandCutEdgeOut(_CutEdgeBase):
+    """跨割饱和的 源点 -> 稿件 边：稿件整体需求无法被源侧满足。"""
+
+    manuscript_id: str
+
+
+class EligibilityCutEdgeOut(_CutEdgeBase):
+    """跨割饱和的 稿件 -> 评审人/(评审人,赛道) 边：唯一/全部合格候选在源侧之外。
+
+    边指向 (评审人, 赛道) 限额节点时 track 给出赛道；直接指向评审人时为 null。
+    """
+
+    manuscript_id: str
+    reviewer_id: str
+    track: str | None = None
+
+
+class TrackCapacityCutEdgeOut(_CutEdgeBase):
+    """跨割饱和的 (评审人, 赛道) -> 评审人 边：该评审人的该赛道限额被占满。"""
+
+    reviewer_id: str
+    track: str
+
+
+class ReviewerCapacityCutEdgeOut(_CutEdgeBase):
+    """跨割饱和的 评审人 -> 汇点 边：评审人总容量被占满。"""
+
+    reviewer_id: str
+
+
+class BottleneckCutOut(BaseModel):
+    """不可行性的全局最小割证明（最大流最小割定理）。
+
+    source_side 为最大流结束后残量网络中源点可达的业务节点；
+    saturated_edges 按业务含义分类列出从源侧跨向割外的饱和边，
+    其容量之和恰为 max_assignable，shortfall = total_required - max_assignable。
+    增量模式下容量/流量口径为锁定固化扣减后的残量网络；max_assignable 已计入
+    必然保留的锁定关系。
+    """
+
+    source_side: "BottleneckCutSourceSide"
+    saturated_edges: "BottleneckCutEdges"
+    max_assignable: int
+    shortfall: int
+
+
+class BottleneckCutSourceSide(BaseModel):
+    manuscript_ids: list[str]
+    reviewer_ids: list[str]
+    reviewer_track_nodes: list["ReviewerTrackNodeOut"]
+
+
+class ReviewerTrackNodeOut(BaseModel):
+    reviewer_id: str
+    track: str
+
+
+class BottleneckCutEdges(BaseModel):
+    demand: list[DemandCutEdgeOut]
+    eligibility: list[EligibilityCutEdgeOut]
+    track_capacity: list[TrackCapacityCutEdgeOut]
+    reviewer_capacity: list[ReviewerCapacityCutEdgeOut]
+
+
+BottleneckCutOut.model_rebuild()
+
+
 class AssignResponse(BaseModel):
     status: Literal["feasible", "infeasible"]
     total_required: int
@@ -155,3 +228,6 @@ class AssignResponse(BaseModel):
     shared_pool: SharedPoolOut | None
     # 锁定关系冲突（仅增量重排模式且锁定不可行时非空）；否则为 null
     locked_conflicts: list[LockedConflictOut] | None = None
+    # 锁定关系合法但剩余需求无法满足时，基于残量网络的全局最小割证明；
+    # 可行或锁定关系校验失败时为 null
+    bottleneck_cut: BottleneckCutOut | None = None

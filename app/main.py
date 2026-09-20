@@ -9,6 +9,7 @@ from .models import (
     AssignmentOut,
     AssignRequest,
     AssignResponse,
+    BottleneckCutOut,
     LockedConflictOut,
     SharedPoolOut,
     UnsatisfiedOut,
@@ -108,6 +109,7 @@ def assign(req: AssignRequest) -> AssignResponse:
             locked_conflicts=[
                 LockedConflictOut(**vars(c)) for c in result.locked_conflicts
             ],
+            bottleneck_cut=None,
         )
 
     if result.feasible:
@@ -122,6 +124,7 @@ def assign(req: AssignRequest) -> AssignResponse:
             unsatisfied=None,
             shared_pool=None,
             locked_conflicts=None,
+            bottleneck_cut=None,
         )
 
     return AssignResponse(
@@ -132,4 +135,9 @@ def assign(req: AssignRequest) -> AssignResponse:
         unsatisfied=[UnsatisfiedOut(**vars(u)) for u in result.unsatisfied],
         shared_pool=SharedPoolOut(**result.shared_pool) if result.shared_pool else None,
         locked_conflicts=None,
+        bottleneck_cut=(
+            BottleneckCutOut(**result.bottleneck_cut)
+            if result.bottleneck_cut
+            else None
+        ),
     )
